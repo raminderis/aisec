@@ -1,15 +1,30 @@
 package controller
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
+	"strconv"
 	"strings"
 )
 
 type addUserRequest struct {
 	Username string `json:"username"`
 	Password string `json:"password"`
+}
+
+type updateUserRequest struct {
+	Username    string `json:"username"`
+	Password    string `json:"password"`
+	NewPassword string `json:"new_password"`
+	Expired     *bool  `json:"expired"`
+}
+
+type updateUserRequestAliases struct {
+	CurrentPassword string `json:"current_password"`
+	NewPassword     string `json:"newPassword"`
 }
 
 type addUserResponse struct {
@@ -21,6 +36,7 @@ type addUserResponse struct {
 type updateUserResponse struct {
 	Message string `json:"message"`
 	User    string `json:"user"`
+	Token   string `json:"token"`
 }
 
 type deleteUserResponse struct {
@@ -32,6 +48,12 @@ type authUserResponse struct {
 	Message       string `json:"message"`
 	User          string `json:"user"`
 	Authenticated bool   `json:"authenticated"`
+}
+
+type verifyTokenResponse struct {
+	Message string `json:"message"`
+	Valid   bool   `json:"valid"`
+	Expired bool   `json:"expired"`
 }
 
 func readUserRequest(r *http.Request) (addUserRequest, error) {
@@ -47,6 +69,57 @@ func readUserRequest(r *http.Request) (addUserRequest, error) {
 	}
 	if req.Password == "" {
 		req.Password = r.URL.Query().Get("password")
+	}
+
+	return req, nil
+}
+
+func readUpdateUserRequest(r *http.Request) (updateUserRequest, error) {
+	var req updateUserRequest
+	if strings.Contains(r.Header.Get("Content-Type"), "application/json") {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			return req, err
+		}
+		if len(bytes.TrimSpace(body)) > 0 {
+			if err := json.Unmarshal(body, &req); err != nil {
+				return req, err
+			}
+			var aliasReq updateUserRequestAliases
+			if err := json.Unmarshal(body, &aliasReq); err == nil {
+				if req.Password == "" {
+					req.Password = aliasReq.CurrentPassword
+				}
+				if req.NewPassword == "" {
+					req.NewPassword = aliasReq.NewPassword
+				}
+			}
+		}
+	}
+
+	if req.Username == "" {
+		req.Username = r.URL.Query().Get("username")
+	}
+	if req.Password == "" {
+		req.Password = r.URL.Query().Get("password")
+	}
+	if req.Password == "" {
+		req.Password = r.URL.Query().Get("current_password")
+	}
+	if req.NewPassword == "" {
+		req.NewPassword = r.URL.Query().Get("new_password")
+	}
+	if req.NewPassword == "" {
+		req.NewPassword = r.URL.Query().Get("newPassword")
+	}
+	if req.Expired == nil {
+		if expiredText := r.URL.Query().Get("expired"); expiredText != "" {
+			expired, err := strconv.ParseBool(expiredText)
+			if err != nil {
+				return req, err
+			}
+			req.Expired = &expired
+		}
 	}
 
 	return req, nil
@@ -101,27 +174,30 @@ func AddHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func updateHandler(w http.ResponseWriter, r *http.Request) {
-	req, err := readUserRequest(r)
+	req, err := readUpdateUserRequest(r)
 	if err != nil {
 		http.Error(w, "invalid JSON body", http.StatusBadRequest)
 		return
 	}
 
-	if req.Username == "" {
-		http.Error(w, "username is required", http.StatusBadRequest)
+	if req.Username == "" || req.Password == "" {
+		http.Error(w, "username and password are required", http.StatusBadRequest)
 		return
 	}
 
 	user := User{
 		Username: req.Username,
-		Password: req.Password,
-		Apitoken: r.URL.Query().Get("api_token"),
-	}
-	if user.Apitoken == "" {
-		user.Apitoken = r.Header.Get("X-API-Token")
 	}
 
-	if err := user.UpdateUser(); err != nil {
+	if err := user.UpdateUser(req.Password, req.NewPassword, req.Expired); err != nil {
+		if errors.Is(err, ErrUserNotFound) {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		if errors.Is(err, ErrInvalidCurrentPassword) {
+			http.Error(w, err.Error(), http.StatusUnauthorized)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -131,6 +207,7 @@ func updateHandler(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(updateUserResponse{
 		Message: "user updated",
 		User:    user.Username,
+		Token:   user.Apitoken,
 	})
 }
 
@@ -230,4 +307,74 @@ func authenticateHandler(w http.ResponseWriter, r *http.Request) {
 
 func AuthenticateHandler(w http.ResponseWriter, r *http.Request) {
 	authenticateHandler(w, r)
+}
+
+func readTokenFromRequest(r *http.Request) (string, error) {
+	authHeader := strings.TrimSpace(r.Header.Get("Authorization"))
+	if strings.HasPrefix(authHeader, "Bearer ") {
+		token := strings.TrimSpace(strings.TrimPrefix(authHeader, "Bearer "))
+		if token != "" {
+			return token, nil
+		}
+	}
+
+	if apiToken := strings.TrimSpace(r.URL.Query().Get("api_token")); apiToken != "" {
+		return apiToken, nil
+	}
+
+	var payload struct {
+		Apitoken string `json:"api_token"`
+	}
+	if strings.Contains(r.Header.Get("Content-Type"), "application/json") {
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			return "", err
+		}
+	}
+
+	return strings.TrimSpace(payload.Apitoken), nil
+}
+
+func verifyHandler(w http.ResponseWriter, r *http.Request) {
+	token, err := readTokenFromRequest(r)
+	if err != nil {
+		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		return
+	}
+	if token == "" {
+		http.Error(w, "api token is required", http.StatusBadRequest)
+		return
+	}
+
+	user := User{Apitoken: token}
+	exists, expired, err := user.VerifyToken()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	status := http.StatusOK
+	message := "token valid"
+	valid := true
+	if !exists {
+		status = http.StatusUnauthorized
+		message = "token not found"
+		valid = false
+		expired = false
+	} else if expired {
+		status = http.StatusUnauthorized
+		message = "token expired"
+		valid = false
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(verifyTokenResponse{
+		Message: message,
+		Valid:   valid,
+		Expired: expired,
+	})
+}
+
+func VerifyHandler(w http.ResponseWriter, r *http.Request) {
+	verifyHandler(w, r)
 }

@@ -24,6 +24,7 @@ func main() {
 	router.Put("/update-user", controller.UpdateHandler)
 	router.Delete("/delete-user", controller.DeleteHandler)
 	router.Post("/authenticate-user", controller.AuthenticateHandler)
+	router.Get("/verify", controller.VerifyHandler)
 
 	log.Printf("security service listening on %s", addr)
 	if err := http.ListenAndServe(addr, router); err != nil {
